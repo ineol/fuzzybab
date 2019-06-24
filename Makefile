@@ -36,7 +36,7 @@ version.h:
 
 babeld.html: babeld.man
 
-.PHONY: all install install.minimal uninstall clean
+.PHONY: all install install.minimal uninstall clean libfuzz
 
 all: babeld babeld.man
 
@@ -55,3 +55,10 @@ uninstall:
 
 clean:
 	-rm -f babeld babeld.html version.h *.o *~ core TAGS gmon.out
+
+objects=main1.o foo.o main2.o bar.o
+mains=main1.o main2.o
+
+libfuzz: CDEBUGFLAGS = -O2 -g -fsanitize=fuzzer,address -D_BABELD_FUZZ
+libfuzz: $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o fuzz_babeld $(OBJS) $(LDLIBS)

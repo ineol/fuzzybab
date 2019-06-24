@@ -427,447 +427,8 @@ network_address(int ae, const unsigned char *a, unsigned int len,
     return network_prefix(ae, -1, 0, a, NULL, len, a_r);
 }
 
-void
-parse_packet(const unsigned char *from, struct interface *ifp,
-             const unsigned char *packet, int packetlen)
-{
-    int i;
-    const unsigned char *message;
-    unsigned char type, len;
-    int bodylen;
-    struct neighbour *neigh;
-    int have_router_id = 0, have_v4_prefix = 0, have_v6_prefix = 0,
-        have_v4_nh = 0, have_v6_nh = 0;
-    unsigned char router_id[8], v4_prefix[16], v6_prefix[16],
-        v4_nh[16], v6_nh[16];
-    int have_hello_rtt = 0;
-    /* Content of the RTT sub-TLV on IHU messages. */
-    unsigned int hello_send_us = 0, hello_rtt_receive_time = 0;
 
-    if(ifp->buf.enable_timestamps) {
-        /* We want to track exactly when we received this packet. */
-        gettime(&now);
-    }
-
-    if(!linklocal(from)) {
-        fprintf(stderr, "Received packet from non-local address %s.\n",
-                format_address(from));
-        return;
-    }
-
-    if(packet[0] != 42) {
-        fprintf(stderr, "Received malformed packet on %s from %s.\n",
-                ifp->name, format_address(from));
-        return;
-    }
-
-    if(packet[1] != 2) {
-        fprintf(stderr,
-                "Received packet with unknown version %d on %s from %s.\n",
-                packet[1], ifp->name, format_address(from));
-        return;
-    }
-
-    neigh = find_neighbour(from, ifp);
-    if(neigh == NULL) {
-        fprintf(stderr, "Couldn't allocate neighbour.\n");
-        return;
-    }
-
-    DO_NTOHS(bodylen, packet + 2);
-
-    if(bodylen + 4 > packetlen) {
-        fprintf(stderr, "Received truncated packet (%d + 4 > %d).\n",
-                bodylen, packetlen);
-        bodylen = packetlen - 4;
-    }
-
-    i = 0;
-    while(i < bodylen) {
-        message = packet + 4 + i;
-        type = message[0];
-        if(type == MESSAGE_PAD1) {
-            debugf("Received pad1 from %s on %s.\n",
-                   format_address(from), ifp->name);
-            i++;
-            continue;
-        }
-        if(i + 1 > bodylen) {
-            fprintf(stderr, "Received truncated message.\n");
-            break;
-        }
-        len = message[1];
-        if(i + len + 2 > bodylen) {
-            fprintf(stderr, "Received truncated message.\n");
-            break;
-        }
-
-        if(type == MESSAGE_PADN) {
-            debugf("Received pad%d from %s on %s.\n",
-                   len, format_address(from), ifp->name);
-        } else if(type == MESSAGE_ACK_REQ) {
-            unsigned short nonce, interval;
-            int rc;
-            if(len < 6) goto fail;
-            DO_NTOHS(nonce, message + 4);
-            DO_NTOHS(interval, message + 6);
-            debugf("Received ack-req (%04X %d) from %s on %s.\n",
-                   nonce, interval, format_address(from), ifp->name);
-            rc = parse_other_subtlv(message + 8, len - 6);
-            if(rc < 0)
-                goto done;
-            send_ack(neigh, nonce, interval);
-        } else if(type == MESSAGE_ACK) {
-            int rc;
-            debugf("Received ack from %s on %s.\n",
-                   format_address(from), ifp->name);
-            rc = parse_other_subtlv(message + 4, len - 2);
-            if(rc < 0)
-                goto done;
-            /* Nothing right now */
-        } else if(type == MESSAGE_HELLO) {
-            unsigned short seqno, interval;
-            int unicast, changed, have_timestamp, rc;
-            unsigned int timestamp;
-            if(len < 6) goto fail;
-            unicast = !!(message[2] & 0x80);
-            DO_NTOHS(seqno, message + 4);
-            DO_NTOHS(interval, message + 6);
-            debugf("Received hello %d (%d) from %s on %s.\n",
-                   seqno, interval,
-                   format_address(from), ifp->name);
-            /* Sub-TLV handling. */
-            rc = parse_hello_subtlv(message + 8, len - 6,
-                                    &timestamp, &have_timestamp);
-            if(rc < 0)
-                goto done;
-            changed =
-                update_neighbour(neigh,
-                                 unicast ? &neigh->uhello : &neigh->hello,
-                                 unicast, seqno, interval);
-            update_neighbour_metric(neigh, changed);
-            if(interval > 0)
-                /* Multiply by 3/2 to allow hellos to expire. */
-                schedule_neighbours_check(interval * 15, 0);
-            if(have_timestamp) {
-                neigh->hello_send_us = timestamp;
-                neigh->hello_rtt_receive_time = now;
-                have_hello_rtt = 1;
-            }
-        } else if(type == MESSAGE_IHU) {
-            unsigned short txcost, interval;
-            unsigned char address[16];
-            int rc;
-            if(len < 6) goto fail;
-            DO_NTOHS(txcost, message + 4);
-            DO_NTOHS(interval, message + 6);
-            rc = network_address(message[2], message + 8, len - 6, address);
-            if(rc < 0) goto fail;
-            debugf("Received ihu %d (%d) from %s on %s for %s.\n",
-                   txcost, interval,
-                   format_address(from), ifp->name,
-                   format_address(address));
-            if(message[2] == 0 || interface_ll_address(ifp, address)) {
-                int changed;
-                rc = parse_ihu_subtlv(message + 8 + rc, len - 6 - rc,
-                                      &hello_send_us, &hello_rtt_receive_time,
-                                      NULL);
-                if(rc < 0)
-                    goto done;
-                changed = txcost != neigh->txcost;
-                neigh->txcost = txcost;
-                neigh->ihu_time = now;
-                neigh->ihu_interval = interval;
-                update_neighbour_metric(neigh, changed);
-                if(interval > 0)
-                    /* Multiply by 3/2 to allow neighbours to expire. */
-                    schedule_neighbours_check(interval * 45, 0);
-            }
-        } else if(type == MESSAGE_ROUTER_ID) {
-            int rc;
-            if(len < 10) {
-                have_router_id = 0;
-                goto fail;
-            }
-            memcpy(router_id, message + 4, 8);
-            have_router_id = 1;
-            debugf("Received router-id %s from %s on %s.\n",
-                   format_eui64(router_id), format_address(from), ifp->name);
-            rc = parse_other_subtlv(message + 12, len - 10);
-            if(rc < 0)
-                goto done;
-        } else if(type == MESSAGE_NH) {
-            unsigned char nh[16];
-            int rc;
-            if(len < 2) {
-                have_v4_nh = 0;
-                have_v6_nh = 0;
-                goto fail;
-            }
-            rc = network_address(message[2], message + 4, len - 2,
-                                 nh);
-            if(rc < 0) {
-                have_v4_nh = 0;
-                have_v6_nh = 0;
-                goto fail;
-            }
-            debugf("Received nh %s (%d) from %s on %s.\n",
-                   format_address(nh), message[2],
-                   format_address(from), ifp->name);
-            if(message[2] == 1) {
-                memcpy(v4_nh, nh, 16);
-                have_v4_nh = 1;
-            } else {
-                memcpy(v6_nh, nh, 16);
-                have_v6_nh = 1;
-            }
-            rc = parse_other_subtlv(message + 4 + rc, len - 2 - rc);
-            if(rc < 0)
-                goto done;
-        } else if(type == MESSAGE_UPDATE) {
-            unsigned char prefix[16], src_prefix[16], *nh;
-            unsigned char plen, src_plen;
-            unsigned char channels[MAX_CHANNEL_HOPS];
-            int channels_len = MAX_CHANNEL_HOPS;
-            unsigned short interval, seqno, metric;
-            int rc, parsed_len, is_ss;
-            if(len < 10) {
-                if(len < 2 || message[3] & 0x80)
-                    have_v4_prefix = have_v6_prefix = 0;
-                goto fail;
-            }
-            DO_NTOHS(interval, message + 6);
-            DO_NTOHS(seqno, message + 8);
-            DO_NTOHS(metric, message + 10);
-            if(message[5] == 0 ||
-               (message[2] == 1 ? have_v4_prefix : have_v6_prefix))
-                rc = network_prefix(message[2], message[4], message[5],
-                                    message + 12,
-                                    message[2] == 1 ? v4_prefix : v6_prefix,
-                                    len - 10, prefix);
-            else
-                rc = -1;
-            if(message[2] == 1) {
-                v4tov6(src_prefix, zeroes);
-                src_plen = 96;
-            } else {
-                memcpy(src_prefix, zeroes, 16);
-                src_plen = 0;
-            }
-            if(rc < 0) {
-                if(message[3] & 0x80)
-                    have_v4_prefix = have_v6_prefix = 0;
-                goto fail;
-            }
-            parsed_len = 10 + rc;
-
-            plen = message[4] + (message[2] == 1 ? 96 : 0);
-
-            if(message[3] & 0x80) {
-                if(message[2] == 1) {
-                    memcpy(v4_prefix, prefix, 16);
-                    have_v4_prefix = 1;
-                } else {
-                    memcpy(v6_prefix, prefix, 16);
-                    have_v6_prefix = 1;
-                }
-            }
-            if(message[3] & 0x40) {
-                if(message[2] == 1) {
-                    memset(router_id, 0, 4);
-                    memcpy(router_id + 4, prefix + 12, 4);
-                } else {
-                    memcpy(router_id, prefix + 8, 8);
-                }
-                have_router_id = 1;
-            }
-            if(!have_router_id && message[2] != 0) {
-                fprintf(stderr, "Received prefix with no router id.\n");
-                goto fail;
-            }
-            debugf("Received update%s%s for %s from %s on %s.\n",
-                   (message[3] & 0x80) ? "/prefix" : "",
-                   (message[3] & 0x40) ? "/id" : "",
-                   format_prefix(prefix, plen),
-                   format_address(from), ifp->name);
-            if(message[2] == 0) {
-                rc = parse_other_subtlv(message + 12, len - 10);
-                if(rc < 0)
-                    goto done;
-                if(metric < 0xFFFF) {
-                    fprintf(stderr,
-                            "Received wildcard update with finite metric.\n");
-                    goto done;
-                }
-                retract_neighbour_routes(neigh);
-                goto done;
-            } else if(message[2] == 1) {
-                if(!have_v4_nh)
-                    goto fail;
-                nh = v4_nh;
-            } else if(have_v6_nh) {
-                nh = v6_nh;
-            } else {
-                nh = neigh->address;
-            }
-
-            rc = parse_update_subtlv(ifp, metric, message[2],
-                                     message + 2 + parsed_len,
-                                     len - parsed_len, channels, &channels_len,
-                                     src_prefix, &src_plen);
-            if(rc < 0)
-                goto done;
-            is_ss = !is_default(src_prefix, src_plen);
-            debugf("Received update%s%s for dst %s%s%s from %s on %s.\n",
-                   (message[3] & 0x80) ? "/prefix" : "",
-                   (message[3] & 0x40) ? "/id" : "",
-                   format_prefix(prefix, plen),
-                   is_ss ? " src " : "",
-                   is_ss ? format_prefix(src_prefix, src_plen) : "",
-                   format_address(from), ifp->name);
-
-            if(message[2] == 1) {
-                if(!ifp->ipv4)
-                    goto done;
-            }
-
-            update_route(router_id, prefix, plen, src_prefix, src_plen, seqno,
-                         metric, interval, neigh, nh,
-                         channels, channels_len);
-        } else if(type == MESSAGE_REQUEST) {
-            unsigned char prefix[16], src_prefix[16], plen, src_plen;
-            int rc, is_ss;
-            if(len < 2) goto fail;
-            rc = network_prefix(message[2], message[3], 0,
-                                message + 4, NULL, len - 2, prefix);
-            if(rc < 0) goto fail;
-            plen = message[3] + (message[2] == 1 ? 96 : 0);
-            if(message[2] == 1) {
-                v4tov6(src_prefix, zeroes);
-                src_plen = 96;
-            } else {
-                memcpy(src_prefix, zeroes, 16);
-                src_plen = 0;
-            }
-            rc = parse_request_subtlv(message[2], message + 4 + rc,
-                                      len - 2 - rc, src_prefix, &src_plen);
-            if(rc < 0)
-                goto done;
-            is_ss = !is_default(src_prefix, src_plen);
-            if(message[2] == 0) {
-                if(is_ss) {
-                    /* Wildcard requests don't carry a source prefix. */
-                    fprintf(stderr,
-                            "Received source-specific wildcard request.\n");
-                    goto done;
-                }
-                debugf("Received request for any from %s on %s.\n",
-                       format_address(from), ifp->name);
-                /* If a neighbour is requesting a full route dump from us,
-                   we might as well send it an IHU. */
-                send_ihu(neigh, NULL);
-                /* Since nodes send wildcard requests on boot, booting
-                   a large number of nodes at the same time may cause an
-                   update storm.  Ignore a wildcard request that happens
-                   shortly after we sent a full update. */
-                if(neigh->ifp->last_update_time <
-                   now.tv_sec - MAX(neigh->ifp->hello_interval / 100, 1)) {
-                    send_update(neigh->ifp, 0, NULL, 0, NULL, 0);
-                }
-            } else {
-                debugf("Received request for dst %s%s%s from %s on %s.\n",
-                       message[2] == 0 ? "" : format_prefix(prefix, plen),
-                       is_ss ? " src " : "",
-                       is_ss ? format_prefix(src_prefix, src_plen) : "",
-                       format_address(from), ifp->name);
-                send_update(neigh->ifp, 0, prefix, plen, src_prefix, src_plen);
-            }
-        } else if(type == MESSAGE_MH_REQUEST) {
-            unsigned char prefix[16], src_prefix[16], plen, src_plen;
-            unsigned short seqno;
-            int rc, is_ss;
-            if(len < 14) goto fail;
-            DO_NTOHS(seqno, message + 4);
-            rc = network_prefix(message[2], message[3], 0,
-                                message + 16, NULL, len - 14, prefix);
-            if(rc < 0) goto fail;
-            if(message[2] == 1) {
-                v4tov6(src_prefix, zeroes);
-                src_plen = 96;
-            } else {
-                memcpy(src_prefix, zeroes, 16);
-                src_plen = 0;
-            }
-            rc = parse_seqno_request_subtlv(message[2], message + 16 + rc,
-                                            len - 14 - rc, src_prefix,
-                                            &src_plen);
-            if(rc < 0)
-                goto done;
-            is_ss = !is_default(src_prefix, src_plen);
-            plen = message[3] + (message[2] == 1 ? 96 : 0);
-            debugf("Received request (%d) for dst %s%s%s from %s on "
-                   "%s (%s, %d).\n",
-                   message[6],
-                   format_prefix(prefix, plen),
-                   is_ss ? " src " : "",
-                   is_ss ? format_prefix(src_prefix, src_plen) : "",
-                   format_address(from), ifp->name,
-                   format_eui64(message + 8), seqno);
-            handle_request(neigh, prefix, plen, src_prefix, src_plen,
-                           message[6], seqno, message + 8);
-        } else {
-            debugf("Received unknown packet type %d from %s on %s.\n",
-                   type, format_address(from), ifp->name);
-        }
-    done:
-        i += len + 2;
-        continue;
-
-    fail:
-        fprintf(stderr, "Couldn't parse packet (%d, %d) from %s on %s.\n",
-                message[0], message[1], format_address(from), ifp->name);
-        goto done;
-    }
-
-    /* We can calculate the RTT to this neighbour. */
-    if(have_hello_rtt && hello_send_us && hello_rtt_receive_time) {
-        int remote_waiting_us, local_waiting_us;
-        unsigned int rtt, smoothed_rtt;
-        unsigned int old_rttcost;
-        int changed = 0;
-        remote_waiting_us = neigh->hello_send_us - hello_rtt_receive_time;
-        local_waiting_us = time_us(neigh->hello_rtt_receive_time) -
-            hello_send_us;
-
-        /* Sanity checks (validity window of 10 minutes). */
-        if(remote_waiting_us < 0 || local_waiting_us < 0 ||
-           remote_waiting_us > 600000000 || local_waiting_us > 600000000)
-            return;
-
-        rtt = MAX(0, local_waiting_us - remote_waiting_us);
-        debugf("RTT to %s on %s sample result: %d us.\n",
-               format_address(from), ifp->name, rtt);
-
-        old_rttcost = neighbour_rttcost(neigh);
-        if(valid_rtt(neigh)) {
-            /* Running exponential average. */
-            smoothed_rtt = (ifp->rtt_decay * rtt +
-                            (256 - ifp->rtt_decay) * neigh->rtt);
-            /* Rounding (up or down) to get closer to the sample. */
-            neigh->rtt = (neigh->rtt >= rtt) ? smoothed_rtt / 256 :
-                (smoothed_rtt + 255) / 256;
-        } else {
-            /* We prefer to be conservative with new neighbours
-               (higher RTT) */
-            assert(rtt <= 0x7FFFFFFF);
-            neigh->rtt = 2*rtt;
-        }
-        changed = (neighbour_rttcost(neigh) == old_rttcost ? 0 : 1);
-        update_neighbour_metric(neigh, changed);
-        neigh->rtt_time = now;
-    }
-    return;
-}
+struct neighbour dummy_neighbour;
 
 static int
 fill_rtt_message(struct buffered *buf)
@@ -1983,3 +1544,470 @@ handle_request(struct neighbour *neigh, const unsigned char *prefix,
     record_resend(RESEND_REQUEST, prefix, plen, src_prefix, src_plen, seqno, id,
                   neigh->ifp, 0);
 }
+
+#ifdef _BABELD_FUZZ
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    struct interface ifp = {};
+    unsigned char from[16] = {0xFE, 0x80};
+
+    if (size < 4)
+        return 0;
+
+    ifp.buf.size = 1000;
+    parse_packet(from, &ifp, data, size);
+
+    return 0;
+}
+
+#define find_neighbour(...) &dummy_neighbour
+#define send_ack(...)
+#define send_ihu(...)
+#define send_update(...)
+#define fprintf(...)
+
+#endif
+
+void
+parse_packet(const unsigned char *from, struct interface *ifp,
+             const unsigned char *packet, int packetlen)
+{
+    int i;
+    const unsigned char *message;
+    unsigned char type, len;
+    int bodylen;
+    struct neighbour *neigh;
+    int have_router_id = 0, have_v4_prefix = 0, have_v6_prefix = 0,
+        have_v4_nh = 0, have_v6_nh = 0;
+    unsigned char router_id[8], v4_prefix[16], v6_prefix[16],
+        v4_nh[16], v6_nh[16];
+    int have_hello_rtt = 0;
+    /* Content of the RTT sub-TLV on IHU messages. */
+    unsigned int hello_send_us = 0, hello_rtt_receive_time = 0;
+
+    if(ifp->buf.enable_timestamps) {
+        /* We want to track exactly when we received this packet. */
+        gettime(&now);
+    }
+
+    if(!linklocal(from)) {
+        fprintf(stderr, "Received packet from non-local address %s.\n",
+                format_address(from));
+        return;
+    }
+
+    if(packet[0] != 42) {
+        fprintf(stderr, "Received malformed packet on %s from %s.\n",
+                ifp->name, format_address(from));
+        return;
+    }
+
+    if(packet[1] != 2) {
+        fprintf(stderr,
+                "Received packet with unknown version %d on %s from %s.\n",
+                packet[1], ifp->name, format_address(from));
+        return;
+    }
+
+    neigh = find_neighbour(from, ifp);
+    if(neigh == NULL) {
+        fprintf(stderr, "Couldn't allocate neighbour.\n");
+        return;
+    }
+
+    DO_NTOHS(bodylen, packet + 2);
+
+    if(bodylen + 4 > packetlen) {
+        fprintf(stderr, "Received truncated packet (%d + 4 > %d).\n",
+                bodylen, packetlen);
+        bodylen = packetlen - 4;
+    }
+
+    i = 0;
+    while(i < bodylen) {
+        message = packet + 4 + i;
+        type = message[0];
+        if(type == MESSAGE_PAD1) {
+            debugf("Received pad1 from %s on %s.\n",
+                   format_address(from), ifp->name);
+            i++;
+            continue;
+        }
+        if(i + 1 > bodylen) {
+            fprintf(stderr, "Received truncated message.\n");
+            break;
+        }
+        len = message[1];
+        if(i + len + 2 > bodylen) {
+            fprintf(stderr, "Received truncated message.\n");
+            break;
+        }
+
+        if(type == MESSAGE_PADN) {
+            debugf("Received pad%d from %s on %s.\n",
+                   len, format_address(from), ifp->name);
+        } else if(type == MESSAGE_ACK_REQ) {
+            unsigned short nonce, interval;
+            int rc;
+            if(len < 6) goto fail;
+            DO_NTOHS(nonce, message + 4);
+            DO_NTOHS(interval, message + 6);
+            debugf("Received ack-req (%04X %d) from %s on %s.\n",
+                   nonce, interval, format_address(from), ifp->name);
+            rc = parse_other_subtlv(message + 8, len - 6);
+            if(rc < 0)
+                goto done;
+            send_ack(neigh, nonce, interval);
+        } else if(type == MESSAGE_ACK) {
+            int rc;
+            debugf("Received ack from %s on %s.\n",
+                   format_address(from), ifp->name);
+            rc = parse_other_subtlv(message + 4, len - 2);
+            if(rc < 0)
+                goto done;
+            /* Nothing right now */
+        } else if(type == MESSAGE_HELLO) {
+            unsigned short seqno, interval;
+            int unicast, changed, have_timestamp, rc;
+            unsigned int timestamp;
+            if(len < 6) goto fail;
+            unicast = !!(message[2] & 0x80);
+            DO_NTOHS(seqno, message + 4);
+            DO_NTOHS(interval, message + 6);
+            debugf("Received hello %d (%d) from %s on %s.\n",
+                   seqno, interval,
+                   format_address(from), ifp->name);
+            /* Sub-TLV handling. */
+            rc = parse_hello_subtlv(message + 8, len - 6,
+                                    &timestamp, &have_timestamp);
+            if(rc < 0)
+                goto done;
+            changed =
+                update_neighbour(neigh,
+                                 unicast ? &neigh->uhello : &neigh->hello,
+                                 unicast, seqno, interval);
+            update_neighbour_metric(neigh, changed);
+            if(interval > 0)
+                /* Multiply by 3/2 to allow hellos to expire. */
+                schedule_neighbours_check(interval * 15, 0);
+            if(have_timestamp) {
+                neigh->hello_send_us = timestamp;
+                neigh->hello_rtt_receive_time = now;
+                have_hello_rtt = 1;
+            }
+        } else if(type == MESSAGE_IHU) {
+            unsigned short txcost, interval;
+            unsigned char address[16];
+            int rc;
+            if(len < 6) goto fail;
+            DO_NTOHS(txcost, message + 4);
+            DO_NTOHS(interval, message + 6);
+            rc = network_address(message[2], message + 8, len - 6, address);
+            if(rc < 0) goto fail;
+            debugf("Received ihu %d (%d) from %s on %s for %s.\n",
+                   txcost, interval,
+                   format_address(from), ifp->name,
+                   format_address(address));
+            if(message[2] == 0 || interface_ll_address(ifp, address)) {
+                int changed;
+                rc = parse_ihu_subtlv(message + 8 + rc, len - 6 - rc,
+                                      &hello_send_us, &hello_rtt_receive_time,
+                                      NULL);
+                if(rc < 0)
+                    goto done;
+                changed = txcost != neigh->txcost;
+                neigh->txcost = txcost;
+                neigh->ihu_time = now;
+                neigh->ihu_interval = interval;
+                update_neighbour_metric(neigh, changed);
+                if(interval > 0)
+                    /* Multiply by 3/2 to allow neighbours to expire. */
+                    schedule_neighbours_check(interval * 45, 0);
+            }
+        } else if(type == MESSAGE_ROUTER_ID) {
+            int rc;
+            if(len < 10) {
+                have_router_id = 0;
+                goto fail;
+            }
+            memcpy(router_id, message + 4, 8);
+            have_router_id = 1;
+            debugf("Received router-id %s from %s on %s.\n",
+                   format_eui64(router_id), format_address(from), ifp->name);
+            rc = parse_other_subtlv(message + 12, len - 10);
+            if(rc < 0)
+                goto done;
+        } else if(type == MESSAGE_NH) {
+            unsigned char nh[16];
+            int rc;
+            if(len < 2) {
+                have_v4_nh = 0;
+                have_v6_nh = 0;
+                goto fail;
+            }
+            rc = network_address(message[2], message + 4, len - 2,
+                                 nh);
+            if(rc < 0) {
+                have_v4_nh = 0;
+                have_v6_nh = 0;
+                goto fail;
+            }
+            debugf("Received nh %s (%d) from %s on %s.\n",
+                   format_address(nh), message[2],
+                   format_address(from), ifp->name);
+            if(message[2] == 1) {
+                memcpy(v4_nh, nh, 16);
+                have_v4_nh = 1;
+            } else {
+                memcpy(v6_nh, nh, 16);
+                have_v6_nh = 1;
+            }
+            rc = parse_other_subtlv(message + 4 + rc, len - 2 - rc);
+            if(rc < 0)
+                goto done;
+        } else if(type == MESSAGE_UPDATE) {
+            unsigned char prefix[16], src_prefix[16], *nh;
+            unsigned char plen, src_plen;
+            unsigned char channels[MAX_CHANNEL_HOPS];
+            int channels_len = MAX_CHANNEL_HOPS;
+            unsigned short interval, seqno, metric;
+            int rc, parsed_len, is_ss;
+            if(len < 10) {
+                if(len < 2 || message[3] & 0x80)
+                    have_v4_prefix = have_v6_prefix = 0;
+                goto fail;
+            }
+            DO_NTOHS(interval, message + 6);
+            DO_NTOHS(seqno, message + 8);
+            DO_NTOHS(metric, message + 10);
+            if(message[5] == 0 ||
+               (message[2] == 1 ? have_v4_prefix : have_v6_prefix))
+                rc = network_prefix(message[2], message[4], message[5],
+                                    message + 12,
+                                    message[2] == 1 ? v4_prefix : v6_prefix,
+                                    len - 10, prefix);
+            else
+                rc = -1;
+            if(message[2] == 1) {
+                v4tov6(src_prefix, zeroes);
+                src_plen = 96;
+            } else {
+                memcpy(src_prefix, zeroes, 16);
+                src_plen = 0;
+            }
+            if(rc < 0) {
+                if(message[3] & 0x80)
+                    have_v4_prefix = have_v6_prefix = 0;
+                goto fail;
+            }
+            parsed_len = 10 + rc;
+
+            plen = message[4] + (message[2] == 1 ? 96 : 0);
+
+            if(message[3] & 0x80) {
+                if(message[2] == 1) {
+                    memcpy(v4_prefix, prefix, 16);
+                    have_v4_prefix = 1;
+                } else {
+                    memcpy(v6_prefix, prefix, 16);
+                    have_v6_prefix = 1;
+                }
+            }
+            if(message[3] & 0x40) {
+                if(message[2] == 1) {
+                    memset(router_id, 0, 4);
+                    memcpy(router_id + 4, prefix + 12, 4);
+                } else {
+                    memcpy(router_id, prefix + 8, 8);
+                }
+                have_router_id = 1;
+            }
+            if(!have_router_id && message[2] != 0) {
+                fprintf(stderr, "Received prefix with no router id.\n");
+                goto fail;
+            }
+            debugf("Received update%s%s for %s from %s on %s.\n",
+                   (message[3] & 0x80) ? "/prefix" : "",
+                   (message[3] & 0x40) ? "/id" : "",
+                   format_prefix(prefix, plen),
+                   format_address(from), ifp->name);
+            if(message[2] == 0) {
+                rc = parse_other_subtlv(message + 12, len - 10);
+                if(rc < 0)
+                    goto done;
+                if(metric < 0xFFFF) {
+                    fprintf(stderr,
+                            "Received wildcard update with finite metric.\n");
+                    goto done;
+                }
+                retract_neighbour_routes(neigh);
+                goto done;
+            } else if(message[2] == 1) {
+                if(!have_v4_nh)
+                    goto fail;
+                nh = v4_nh;
+            } else if(have_v6_nh) {
+                nh = v6_nh;
+            } else {
+                nh = neigh->address;
+            }
+
+            rc = parse_update_subtlv(ifp, metric, message[2],
+                                     message + 2 + parsed_len,
+                                     len - parsed_len, channels, &channels_len,
+                                     src_prefix, &src_plen);
+            if(rc < 0)
+                goto done;
+            is_ss = !is_default(src_prefix, src_plen);
+            debugf("Received update%s%s for dst %s%s%s from %s on %s.\n",
+                   (message[3] & 0x80) ? "/prefix" : "",
+                   (message[3] & 0x40) ? "/id" : "",
+                   format_prefix(prefix, plen),
+                   is_ss ? " src " : "",
+                   is_ss ? format_prefix(src_prefix, src_plen) : "",
+                   format_address(from), ifp->name);
+
+            if(message[2] == 1) {
+                if(!ifp->ipv4)
+                    goto done;
+            }
+
+            update_route(router_id, prefix, plen, src_prefix, src_plen, seqno,
+                         metric, interval, neigh, nh,
+                         channels, channels_len);
+        } else if(type == MESSAGE_REQUEST) {
+            unsigned char prefix[16], src_prefix[16], plen, src_plen;
+            int rc, is_ss;
+            if(len < 2) goto fail;
+            rc = network_prefix(message[2], message[3], 0,
+                                message + 4, NULL, len - 2, prefix);
+            if(rc < 0) goto fail;
+            plen = message[3] + (message[2] == 1 ? 96 : 0);
+            if(message[2] == 1) {
+                v4tov6(src_prefix, zeroes);
+                src_plen = 96;
+            } else {
+                memcpy(src_prefix, zeroes, 16);
+                src_plen = 0;
+            }
+            rc = parse_request_subtlv(message[2], message + 4 + rc,
+                                      len - 2 - rc, src_prefix, &src_plen);
+            if(rc < 0)
+                goto done;
+            is_ss = !is_default(src_prefix, src_plen);
+            if(message[2] == 0) {
+                if(is_ss) {
+                    /* Wildcard requests don't carry a source prefix. */
+                    fprintf(stderr,
+                            "Received source-specific wildcard request.\n");
+                    goto done;
+                }
+                debugf("Received request for any from %s on %s.\n",
+                       format_address(from), ifp->name);
+                /* If a neighbour is requesting a full route dump from us,
+                   we might as well send it an IHU. */
+                send_ihu(neigh, NULL);
+                /* Since nodes send wildcard requests on boot, booting
+                   a large number of nodes at the same time may cause an
+                   update storm.  Ignore a wildcard request that happens
+                   shortly after we sent a full update. */
+                if(neigh->ifp->last_update_time <
+                   now.tv_sec - MAX(neigh->ifp->hello_interval / 100, 1)) {
+                    send_update(neigh->ifp, 0, NULL, 0, NULL, 0);
+                }
+            } else {
+                debugf("Received request for dst %s%s%s from %s on %s.\n",
+                       message[2] == 0 ? "" : format_prefix(prefix, plen),
+                       is_ss ? " src " : "",
+                       is_ss ? format_prefix(src_prefix, src_plen) : "",
+                       format_address(from), ifp->name);
+                send_update(neigh->ifp, 0, prefix, plen, src_prefix, src_plen);
+            }
+        } else if(type == MESSAGE_MH_REQUEST) {
+            unsigned char prefix[16], src_prefix[16], plen, src_plen;
+            unsigned short seqno;
+            int rc, is_ss;
+            if(len < 14) goto fail;
+            DO_NTOHS(seqno, message + 4);
+            rc = network_prefix(message[2], message[3], 0,
+                                message + 16, NULL, len - 14, prefix);
+            if(rc < 0) goto fail;
+            if(message[2] == 1) {
+                v4tov6(src_prefix, zeroes);
+                src_plen = 96;
+            } else {
+                memcpy(src_prefix, zeroes, 16);
+                src_plen = 0;
+            }
+            rc = parse_seqno_request_subtlv(message[2], message + 16 + rc,
+                                            len - 14 - rc, src_prefix,
+                                            &src_plen);
+            if(rc < 0)
+                goto done;
+            is_ss = !is_default(src_prefix, src_plen);
+            plen = message[3] + (message[2] == 1 ? 96 : 0);
+            debugf("Received request (%d) for dst %s%s%s from %s on "
+                   "%s (%s, %d).\n",
+                   message[6],
+                   format_prefix(prefix, plen),
+                   is_ss ? " src " : "",
+                   is_ss ? format_prefix(src_prefix, src_plen) : "",
+                   format_address(from), ifp->name,
+                   format_eui64(message + 8), seqno);
+            handle_request(neigh, prefix, plen, src_prefix, src_plen,
+                           message[6], seqno, message + 8);
+        } else {
+            debugf("Received unknown packet type %d from %s on %s.\n",
+                   type, format_address(from), ifp->name);
+        }
+    done:
+        i += len + 2;
+        continue;
+
+    fail:
+        fprintf(stderr, "Couldn't parse packet (%d, %d) from %s on %s.\n",
+                message[0], message[1], format_address(from), ifp->name);
+        goto done;
+    }
+
+    /* We can calculate the RTT to this neighbour. */
+    if(have_hello_rtt && hello_send_us && hello_rtt_receive_time) {
+        int remote_waiting_us, local_waiting_us;
+        unsigned int rtt, smoothed_rtt;
+        unsigned int old_rttcost;
+        int changed = 0;
+        remote_waiting_us = neigh->hello_send_us - hello_rtt_receive_time;
+        local_waiting_us = time_us(neigh->hello_rtt_receive_time) -
+            hello_send_us;
+
+        /* Sanity checks (validity window of 10 minutes). */
+        if(remote_waiting_us < 0 || local_waiting_us < 0 ||
+           remote_waiting_us > 600000000 || local_waiting_us > 600000000)
+            return;
+
+        rtt = MAX(0, local_waiting_us - remote_waiting_us);
+        debugf("RTT to %s on %s sample result: %d us.\n",
+               format_address(from), ifp->name, rtt);
+
+        old_rttcost = neighbour_rttcost(neigh);
+        if(valid_rtt(neigh)) {
+            /* Running exponential average. */
+            smoothed_rtt = (ifp->rtt_decay * rtt +
+                            (256 - ifp->rtt_decay) * neigh->rtt);
+            /* Rounding (up or down) to get closer to the sample. */
+            neigh->rtt = (neigh->rtt >= rtt) ? smoothed_rtt / 256 :
+                (smoothed_rtt + 255) / 256;
+        } else {
+            /* We prefer to be conservative with new neighbours
+               (higher RTT) */
+            assert(rtt <= 0x7FFFFFFF);
+            neigh->rtt = 2*rtt;
+        }
+        changed = (neighbour_rttcost(neigh) == old_rttcost ? 0 : 1);
+        update_neighbour_metric(neigh, changed);
+        neigh->rtt_time = now;
+    }
+    return;
+}
+
+
